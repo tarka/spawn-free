@@ -1,0 +1,10 @@
+[package]
+name = "spawn-free"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3.31"
+
+[dev-dependencies]
+async-io = "2.6.0"

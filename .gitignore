@@ -1,0 +1,6 @@
+/target
+/Cargo.lock
+\#*\#
+.envrc
+*~
+/.dir-locals.el
