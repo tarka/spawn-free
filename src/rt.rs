@@ -1,25 +1,20 @@
-
 use std::{
-    collections::HashMap, future::{Future, IntoFuture}, pin::Pin, rc::Rc, sync::Arc, task::{Context, ContextBuilder, LocalWake, LocalWaker, Poll, Wake, Waker}, thread
+    cell::Cell, collections::HashMap, future::{Future, IntoFuture}, pin::Pin, rc::Rc, sync::atomic::{AtomicU64, Ordering}, task::{ContextBuilder, LocalWake, LocalWaker, Poll, Waker}
 };
 
-use io_uring::IoUring;
+use io_uring::{IoUring, squeue::Entry};
 
 use crate::Result;
 
-// thread_local! {
-//     static LOCAL_WAKER: Waker = {
-//         let uw = Arc::new(SpawnFree {
-//             uring: IoUring::new(64).unwrap(),
-//             tasks: HashMap::new(),
-//         });
-//         Waker::from(uw)
-//     };
-// }
-
-struct SpawnFree {
+pub struct SpawnFree {
     uring: IoUring,
-    tasks: HashMap<u64, Pin<Box<dyn Future<Output = ()>>>>,
+    tasks: HashMap<u64, Task>,
+    next_tok: AtomicU64,
+
+}
+
+thread_local! {
+    pub(crate) static RT: SpawnFree = SpawnFree::new().unwrap();
 }
 
 impl SpawnFree {
@@ -28,46 +23,109 @@ impl SpawnFree {
         Ok(Self {
             uring: IoUring::new(64)?,
             tasks: HashMap::new(),
+            next_tok: AtomicU64::new(0),
         })
     }
 
-    pub fn run_future<F: IntoFuture>(self, fut: F) -> F::Output {
+    pub fn run_future<F: IntoFuture>(&mut self, fut: F) -> F::Output {
         let mut fut = core::pin::pin!(fut.into_future());
 
-        let lw = Rc::new(self);
-        let waker = LocalWaker::from(lw);
+        let uwaker = Rc::new(IoUringWaker::new());
+        let waker = LocalWaker::from(uwaker.clone());
         let mut context = ContextBuilder::from_waker(Waker::noop())
             .local_waker(&waker)
             .build();
 
         loop {
             match fut.as_mut().poll(&mut context) {
-                Poll::Pending => thread::park(),
+                Poll::Pending => {
+                    self.wait_and_wake().unwrap();
+                },
                 Poll::Ready(item) => break item,
             }
         }
     }
+
+    pub(crate) fn submit(&mut self, task: Task) -> Result<()> {
+        let tok = self.next_tok.fetch_add(1, Ordering::SeqCst);
+        let op = task.op.clone()
+            .user_data(tok);
+
+        println!("QUEUEING {:?}", op);
+        unsafe {
+            self.uring.submission()
+                .push(&op).unwrap()
+        };
+        println!("SUBMITTED");
+
+        self.tasks.insert(tok, task);
+
+        Ok(())
+    }
+
+    fn wait_and_wake(&mut self) -> Result<()> {
+        let _n = self.uring.submit_and_wait(1)?;
+
+        let completions = self.uring
+            .completion();
+
+        for entry in completions {
+            let id = entry.user_data();
+            let task = self.tasks.remove(&id)
+                .unwrap();  // FIXME
+        }
+
+        Ok(())
+    }
 }
 
 
-//struct LW {}
+pub(crate) struct Task {
+    op: Entry,
+    future: Pin<Box<dyn Future<Output = ()>>>,
+}
 
-//impl LocalWake for LW {
-impl LocalWake for SpawnFree {
+
+struct IoUringWaker {
+}
+
+impl IoUringWaker {
+    fn new() -> Self {
+        Self { }
+    }
+}
+
+// impl IoUringWaker {
+
+//     fn wait_and_wake(self: &Rc<Self>) {
+//         let _n = self.uring.submit_and_wait(1)
+//             .unwrap(); // FIXME
+
+//         let mut iuw = self.clone();
+//         let completions = Rc::get_mut(&mut iuw).unwrap()
+//             .uring.completion();
+
+//         for entry in completions {
+//             let id = entry.user_data();
+//             let task = self.tasks.get(&id).unwrap();
+//         }
+//     }
+
+// }
+
+impl LocalWake for IoUringWaker {
     fn wake(self: Rc<Self>) {
-        let mut lw = self.clone();
-        // let completions = Rc::get_mut(&mut lw).unwrap().uring.completion();
-        // for entry in completions {
-        //     let id = entry.user_data();
-        //    let task = self.tasks.get(&id).unwrap();
-        // }
+       // let mut lw = self.clone();
+       //  let completions = Rc::get_mut(&mut lw).unwrap().uring.completion();
+       //  for entry in completions {
+       //      let id = entry.user_data();
+       //     let task = self.tasks.get(&id).unwrap();
+       //  }
     }
 
     // fn wake_by_ref(self: &Rc<Self>) {
     // }
 }
-
-
 
 
 #[cfg(test)]
@@ -79,10 +137,11 @@ mod tests {
     }
 
     #[test]
-    fn test_timer() {
-        let rt = SpawnFree::new().unwrap();
+    fn test_timer() -> Result<()> {
+        let mut rt = SpawnFree::new()?;
         let sq = rt.run_future(async_sq(10));
         assert_eq!(100, sq);
+        Ok(())
     }
 
 }
