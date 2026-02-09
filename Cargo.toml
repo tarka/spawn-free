@@ -8,3 +8,4 @@ async-io = "2.6.0"
 
 [dependencies]
 io-uring = "0.7.11"
+thiserror = "2.0.18"
