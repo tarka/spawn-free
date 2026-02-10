@@ -4,41 +4,6 @@ use io_uring::{opcode, types::Timespec};
 
 use crate::rt::Task;
 
-
-// struct Delay {
-//     when: Instant,
-// }
-
-// impl Future for Delay {
-//     type Output = &'static str;
-
-//     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>)
-//         -> Poll<&'static str>
-//     {
-//         if Instant::now() >= self.when {
-//             println!("Hello world");
-//             Poll::Ready("done")
-//         } else {
-//             // Get a handle to the waker for the current task
-//             let waker = cx.waker().clone();
-//             let when = self.when;
-
-//             // // Spawn a timer thread.
-//             // thread::spawn(move || {
-//             //     let now = Instant::now();
-
-//             //     if now < when {
-//             //         thread::sleep(when - now);
-//             //     }
-
-//             //     waker.wake();
-//             // });
-
-//             Poll::Pending
-//         }
-//     }
-// }
-
 pub struct Sleep {
     task: Rc<Task>,
 }
@@ -54,8 +19,9 @@ impl Future for Sleep {
     }
 }
 
+pub fn sleep(duration: Duration) -> Sleep {
+    println!("Sleep({duration:?})");
 
-pub async fn sleep(duration: Duration) -> Sleep {
     let wait_for = Timespec::new()
         .sec(duration.as_secs());
 
@@ -64,20 +30,22 @@ pub async fn sleep(duration: Duration) -> Sleep {
 
     let fut = Box::pin(async move {
         let val: Box<dyn Any> = Box::new(12);
-            val
+        val
     });
 
+    println!("Sleep() submit {op:?}");
     let task = crate::rt::RT.with(|rt| {
-        rt.submit(op, fut)
+        rt.submit_io(op, fut, "sleep")
             .unwrap()
     });
 
+    println!("Sleep() returning Sleep");
     Sleep { task }
 }
 
 #[cfg(test)]
 mod test {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use crate::rt;
 
@@ -86,15 +54,19 @@ mod test {
     fn test_sleep() {
         rt::RT.with(|rt| {
             rt.run_future(
-                async {
-                    let start = Instant::now();
-                    println!("Start sleep: {start:?}");
-                    super::sleep(Duration::from_secs(2)).await;
-                    let end = Instant::now();
-                    println!("Start: {end:?}");
-                    let diff = end - start;
-                    println!("Slept {diff:?}");
-                })
+                // async {
+                //     let start = Instant::now();
+                //     println!("Start sleep: {start:?}");
+                //     super::sleep(Duration::from_secs(2)).await;
+                //     let end = Instant::now();
+                //     println!("Start: {end:?}");
+                //     let diff = end - start;
+                //     println!("Slept {diff:?}");
+                // }
+
+                super::sleep(Duration::from_secs(2))
+
+            )
         });
         panic!();
     }
