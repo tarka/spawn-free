@@ -1,7 +1,7 @@
 
 use std::{
     any::Any,
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     future::{Future, IntoFuture},
     pin::Pin,
@@ -16,13 +16,15 @@ use crate::errors::Result;
 
 pub struct SpawnFree {
     uring: IoUring,
-    tasks: HashMap<u64, Task>,
+    tasks: HashMap<u64, Rc<Task>>,
     next_tok: AtomicU64,
     waker: Rc<IoUringWaker>,
 }
 
+type AnyFuture = Pin<Box<dyn Future<Output = Box<dyn Any>>>>;
+
 thread_local! {
-    pub(crate) static RT: SpawnFree = SpawnFree::new().unwrap();
+    pub(crate) static RT:  RefCell<SpawnFree> = RefCell::new(SpawnFree::new().unwrap());
 }
 
 impl SpawnFree {
@@ -55,9 +57,9 @@ impl SpawnFree {
         }
     }
 
-    pub(crate) fn submit<O>(&mut self, task: Task) -> Result<()> {
+    pub(crate) fn submit(&mut self, op: Entry, future: AnyFuture) -> Result<Rc<Task>> {
         let tok = self.next_tok.fetch_add(1, Ordering::SeqCst);
-        let op = task.op.clone()
+        let op = op.clone()
             .user_data(tok);
 
         println!("QUEUEING {:?}", op);
@@ -67,9 +69,11 @@ impl SpawnFree {
         };
         println!("SUBMITTED");
 
-        self.tasks.insert(tok, task);
+        let task = Rc::new(Task::new(op, future));
 
-        Ok(())
+        self.tasks.insert(tok, task.clone());
+
+        Ok(task)
     }
 
     fn wait_and_wake(&mut self) -> Result<()> {
@@ -80,7 +84,7 @@ impl SpawnFree {
 
         for entry in completions {
             let tok = entry.user_data();
-            let mut task = self.tasks.remove(&tok)
+            let task = self.tasks.remove(&tok)
                 .unwrap();  // FIXME
             task.set_ready(); // FIXME??
 
@@ -90,7 +94,8 @@ impl SpawnFree {
                 .build();
 
             // FIXME??
-            let _ = task.future.as_mut().poll(&mut context);
+            let mut future = task.future.borrow_mut();
+            let _ = future.as_mut().poll(&mut context);
         }
 
         Ok(())
@@ -99,25 +104,21 @@ impl SpawnFree {
 
 
 pub(crate) struct Task {
-    op: Entry,
-    state: Cell<Poll<()>>,
-    future: Pin<Box<dyn Future<Output = Box<dyn Any>>>>,
+    pub _op: Entry,
+    pub state: Cell<Poll<()>>,
+    pub future: RefCell<AnyFuture>,
 }
 
 impl Task {
-    fn new(op: Entry, future: Pin<Box<dyn Future<Output = Box<dyn Any>>>>) -> Self {
+    pub fn new(_op: Entry, future: Pin<Box<dyn Future<Output = Box<dyn Any>>>>) -> Self {
         Self {
-            op,
-            future,
+            _op,
+            future: RefCell::new(future),
             state: Cell::new(Poll::Pending),
         }
     }
 
-    fn op(&self) -> &Entry {
-        &self.op
-    }
-
-    fn set_ready(&self) {
+    pub fn set_ready(&self) {
         self.state.set(Poll::Ready(()));
     }
 }
