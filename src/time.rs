@@ -1,9 +1,8 @@
-use std::{pin::Pin, task::{Context, Poll}, time::{Duration, Instant}};
+use std::{future::Pending, pin::Pin, task::{Context, Poll}, time::{Duration, Instant}};
 
 use io_uring::{opcode::{self, Timeout}, types::Timespec};
 
 use crate::rt::Task;
-
 
 
 struct Delay {
@@ -40,11 +39,20 @@ impl Future for Delay {
     }
 }
 
-pub struct Sleep {
-    duration: Duration,
-}
+// struct Sleep {
+//     task: Task,
+// }
+
+// impl Future for Sleep {
+//     type Output = ();
+
+//     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        
+//     }
+// }
+
 
 // pub async fn sleep(duration: Duration) -> Sleep {
-
+    
 
 // }

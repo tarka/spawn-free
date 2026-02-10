@@ -1,16 +1,24 @@
+
 use std::{
-    cell::Cell, collections::HashMap, future::{Future, IntoFuture}, pin::Pin, rc::Rc, sync::atomic::{AtomicU64, Ordering}, task::{ContextBuilder, LocalWake, LocalWaker, Poll, Waker}
+    any::Any,
+    cell::Cell,
+    collections::HashMap,
+    future::{Future, IntoFuture},
+    pin::Pin,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+    task::{ContextBuilder, LocalWake, LocalWaker, Poll, Waker},
 };
 
 use io_uring::{IoUring, squeue::Entry};
 
-use crate::Result;
+use crate::errors::Result;
 
 pub struct SpawnFree {
     uring: IoUring,
     tasks: HashMap<u64, Task>,
     next_tok: AtomicU64,
-
+    waker: Rc<IoUringWaker>,
 }
 
 thread_local! {
@@ -20,18 +28,19 @@ thread_local! {
 impl SpawnFree {
 
     pub fn new() -> Result<Self> {
+
         Ok(Self {
             uring: IoUring::new(64)?,
             tasks: HashMap::new(),
             next_tok: AtomicU64::new(0),
+            waker: Rc::new(IoUringWaker::new()),
         })
     }
 
     pub fn run_future<F: IntoFuture>(&mut self, fut: F) -> F::Output {
         let mut fut = core::pin::pin!(fut.into_future());
 
-        let uwaker = Rc::new(IoUringWaker::new());
-        let waker = LocalWaker::from(uwaker.clone());
+        let waker = LocalWaker::from(self.waker.clone());
         let mut context = ContextBuilder::from_waker(Waker::noop())
             .local_waker(&waker)
             .build();
@@ -46,7 +55,7 @@ impl SpawnFree {
         }
     }
 
-    pub(crate) fn submit(&mut self, task: Task) -> Result<()> {
+    pub(crate) fn submit<O>(&mut self, task: Task) -> Result<()> {
         let tok = self.next_tok.fetch_add(1, Ordering::SeqCst);
         let op = task.op.clone()
             .user_data(tok);
@@ -70,9 +79,18 @@ impl SpawnFree {
             .completion();
 
         for entry in completions {
-            let id = entry.user_data();
-            let task = self.tasks.remove(&id)
+            let tok = entry.user_data();
+            let mut task = self.tasks.remove(&tok)
                 .unwrap();  // FIXME
+            task.set_ready(); // FIXME??
+
+            let waker = LocalWaker::from(self.waker.clone());
+            let mut context = ContextBuilder::from_waker(Waker::noop())
+                .local_waker(&waker)
+                .build();
+
+            // FIXME??
+            let _ = task.future.as_mut().poll(&mut context);
         }
 
         Ok(())
@@ -82,10 +100,30 @@ impl SpawnFree {
 
 pub(crate) struct Task {
     op: Entry,
-    future: Pin<Box<dyn Future<Output = ()>>>,
+    state: Cell<Poll<()>>,
+    future: Pin<Box<dyn Future<Output = Box<dyn Any>>>>,
+}
+
+impl Task {
+    fn new(op: Entry, future: Pin<Box<dyn Future<Output = Box<dyn Any>>>>) -> Self {
+        Self {
+            op,
+            future,
+            state: Cell::new(Poll::Pending),
+        }
+    }
+
+    fn op(&self) -> &Entry {
+        &self.op
+    }
+
+    fn set_ready(&self) {
+        self.state.set(Poll::Ready(()));
+    }
 }
 
 
+#[derive(Clone)]
 struct IoUringWaker {
 }
 
@@ -94,6 +132,8 @@ impl IoUringWaker {
         Self { }
     }
 }
+
+
 
 // impl IoUringWaker {
 
