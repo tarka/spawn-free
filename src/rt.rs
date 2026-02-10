@@ -15,8 +15,8 @@ use io_uring::{IoUring, squeue::Entry};
 use crate::errors::Result;
 
 pub struct SpawnFree {
-    uring: IoUring,
-    tasks: HashMap<u64, Rc<Task>>,
+    uring: RefCell<IoUring>,
+    tasks: RefCell<HashMap<u64, Rc<Task>>>,
     next_tok: AtomicU64,
     waker: Rc<IoUringWaker>,
 }
@@ -24,7 +24,7 @@ pub struct SpawnFree {
 type AnyFuture = Pin<Box<dyn Future<Output = Box<dyn Any>>>>;
 
 thread_local! {
-    pub(crate) static RT:  RefCell<SpawnFree> = RefCell::new(SpawnFree::new().unwrap());
+    pub(crate) static RT:  Rc<SpawnFree> = Rc::new(SpawnFree::new().unwrap());
 }
 
 impl SpawnFree {
@@ -32,14 +32,14 @@ impl SpawnFree {
     pub fn new() -> Result<Self> {
 
         Ok(Self {
-            uring: IoUring::new(64)?,
-            tasks: HashMap::new(),
+            uring: RefCell::new(IoUring::new(64)?),
+            tasks: RefCell::new(HashMap::new()),
             next_tok: AtomicU64::new(0),
             waker: Rc::new(IoUringWaker::new()),
         })
     }
 
-    pub fn run_future<F: IntoFuture>(&mut self, fut: F) -> F::Output {
+    pub fn run_future<F: IntoFuture>(&self, fut: F) -> F::Output {
         let mut fut = core::pin::pin!(fut.into_future());
 
         let waker = LocalWaker::from(self.waker.clone());
@@ -47,44 +47,53 @@ impl SpawnFree {
             .local_waker(&waker)
             .build();
 
-        loop {
+        println!("Running Future");
+
+        let retval = loop {
             match fut.as_mut().poll(&mut context) {
                 Poll::Pending => {
                     self.wait_and_wake().unwrap();
                 },
                 Poll::Ready(item) => break item,
             }
-        }
+        };
+        println!("End of Future");
+        retval
     }
 
-    pub(crate) fn submit(&mut self, op: Entry, future: AnyFuture) -> Result<Rc<Task>> {
+
+    pub(crate) fn submit(&self, op: Entry, future: AnyFuture) -> Result<Rc<Task>> {
         let tok = self.next_tok.fetch_add(1, Ordering::SeqCst);
         let op = op.clone()
             .user_data(tok);
 
         println!("QUEUEING {:?}", op);
+        let mut uring = self.uring.borrow_mut();
         unsafe {
-            self.uring.submission()
+            uring.submission()
                 .push(&op).unwrap()
         };
         println!("SUBMITTED");
 
         let task = Rc::new(Task::new(op, future));
 
-        self.tasks.insert(tok, task.clone());
+        self.tasks.borrow_mut().insert(tok, task.clone());
 
         Ok(task)
     }
 
-    fn wait_and_wake(&mut self) -> Result<()> {
-        let _n = self.uring.submit_and_wait(1)?;
+    fn wait_and_wake(&self) -> Result<()> {
+        println!("Wait & Wake");
+        let mut uring = self.uring.borrow_mut();
+        let _n = uring.submit_and_wait(1)?;
 
-        let completions = self.uring
+        let completions = uring
             .completion();
 
         for entry in completions {
             let tok = entry.user_data();
-            let task = self.tasks.remove(&tok)
+            let task = self.tasks.borrow_mut()
+                .remove(&tok)
                 .unwrap();  // FIXME
             task.set_ready(); // FIXME??
 
@@ -179,7 +188,7 @@ mod tests {
 
     #[test]
     fn test_timer() -> Result<()> {
-        let mut rt = SpawnFree::new()?;
+        let rt = SpawnFree::new()?;
         let sq = rt.run_future(async_sq(10));
         assert_eq!(100, sq);
         Ok(())

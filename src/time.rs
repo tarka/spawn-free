@@ -47,7 +47,10 @@ impl Future for Sleep {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.task.state.get()
+        println!("Sleep Polled");
+        let state = self.task.state.get();
+        println!("State = {state:?}");
+        state
     }
 }
 
@@ -65,7 +68,7 @@ pub async fn sleep(duration: Duration) -> Sleep {
     });
 
     let task = crate::rt::RT.with(|rt| {
-        rt.borrow_mut().submit(op, fut)
+        rt.submit(op, fut)
             .unwrap()
     });
 
@@ -74,7 +77,7 @@ pub async fn sleep(duration: Duration) -> Sleep {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use crate::rt;
 
@@ -82,13 +85,18 @@ mod test {
     #[test]
     fn test_sleep() {
         rt::RT.with(|rt| {
-            rt.borrow_mut().run_future(
+            rt.run_future(
                 async {
-                    println!("Start sleep");
+                    let start = Instant::now();
+                    println!("Start sleep: {start:?}");
                     super::sleep(Duration::from_secs(2)).await;
-                    println!("Slept");
+                    let end = Instant::now();
+                    println!("Start: {end:?}");
+                    let diff = end - start;
+                    println!("Slept {diff:?}");
                 })
         });
+        panic!();
     }
 
 }
