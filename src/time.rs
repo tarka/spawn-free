@@ -3,7 +3,7 @@ use std::{any::Any, cell::{Cell, RefCell}, pin::Pin, rc::Rc, task::{Context, Pol
 use io_uring::{opcode, types::Timespec};
 use tracing::{info, warn};
 
-use crate::rt::Task;
+use crate::rt::{SpawnFree, Task};
 
 pub struct Sleep {
     duration: Duration,
@@ -28,6 +28,7 @@ impl Sleep {
         info!("Setup timeout for {wait_for:?}");
 
         let op = opcode::Timeout::new(&wait_for)
+            .count(0)
             .build();
 
         let fut = Box::pin(async move {
@@ -36,10 +37,9 @@ impl Sleep {
         });
 
         info!("Sleep() submit {op:?}");
-        let task = crate::rt::RT.with(|rt| {
-            rt.submit_io(op, fut, "sleep")
-                .unwrap()
-        });
+        let task = SpawnFree::current()
+            .submit_io(op, fut, "sleep")
+            .unwrap();
 
         task
     }
@@ -80,28 +80,31 @@ mod test {
     use std::time::{Duration, Instant};
     use test_log::test;
 
-    use crate::rt;
+    use crate::rt::SpawnFree;
 
 
     #[test]
-    fn test_sleep() {
-        rt::RT.with(|rt| {
-            rt.run_future(
-                // async {
-                //     let start = Instant::now();
-                //     info!("Start sleep: {start:?}");
-                //     super::sleep(Duration::from_secs(2)).await;
-                //     let end = Instant::now();
-                //     info!("Start: {end:?}");
-                //     let diff = end - start;
-                //     info!("Slept {diff:?}");
-                // }
-
+    fn test_sleep_single() {
+        SpawnFree::current()
+            .run_future(
                super::sleep(Duration::from_secs(2))
+            );
+    }
 
-            )
-        });
-//        panic!();
+    #[test]
+    fn test_sleep_wrapped() {
+        SpawnFree::current()
+            .run_future(
+                async {
+                    let start = Instant::now();
+                    info!("Start sleep: {start:?}");
+                    super::sleep(Duration::from_secs(2)).await;
+                    let end = Instant::now();
+                    info!("Start: {end:?}");
+                    let diff = end - start;
+                    info!("Slept {diff:?}");
+                }
+            );
     }
 
 }

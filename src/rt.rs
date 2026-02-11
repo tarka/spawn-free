@@ -21,7 +21,6 @@ use crate::errors::Result;
 pub struct SpawnFree {
     #[derivative(Debug="ignore")]
     uring: RefCell<IoUring>,
-    tasks: RefCell<VecDeque<Rc<Task>>>,
     io_pending: RefCell<HashMap<u64, Rc<Task>>>,
     next_tok: AtomicU64,
     waker: Rc<IoUringWaker>,
@@ -39,79 +38,44 @@ impl SpawnFree {
     pub fn new() -> Result<Self> {
 
         Ok(Self {
-            uring: RefCell::new(IoUring::new(64)?),
-            tasks: RefCell::new(VecDeque::new()),
+            uring: RefCell::new(IoUring::new(16)?),
             io_pending: RefCell::new(HashMap::new()),
-            next_tok: AtomicU64::new(0),
+            next_tok: AtomicU64::new(1),
             waker: Rc::new(IoUringWaker::new()),
         })
     }
 
+    pub fn current() -> Rc<Self> {
+        RT.with(|rt| rt.clone())
+    }
+
     #[tracing::instrument(skip(self, future))]
     pub fn run_future<F: Future<Output = O> + 'static, O>(&self, future: F) -> () {
-        //let mut future = core::pin::pin!(future);
-        //let mut future = Box::pin(future);
+        let mut future = core::pin::pin!(future);
 
         let waker = LocalWaker::from(self.waker.clone());
         let mut context = ContextBuilder::from_waker(Waker::noop())
             .local_waker(&waker)
             .build();
 
-        info!("Running Future");
-        let fut = Box::pin(async move {
-            let _ret = future.await;
-            let val: Box<dyn Any> = Box::new(12);
-            val
-        });
-        let topt = self.submit_task(fut, "top level");
+        let mut done = false; // FIXME
 
-        loop {
-            let mut task_p = self.tasks.borrow_mut().pop_front();
-
-            while let Some(task) = task_p {
-                let name = task.name;
-                info!("POLLING {name}");
-                match task.future.borrow_mut().as_mut().poll(&mut context) {
-                    Poll::Pending => {
-                        info!("{name}: State is pending, pushing back");
-                        self.tasks.borrow_mut().push_back(task.clone());
-                    },
-                    Poll::Ready(_item) => {
-                        info!("{name}: State is Ready, returning value");
-                        //break item
-                    },
-                }
-                self.wait_and_wake().unwrap();
-                task_p = self.tasks.borrow_mut().pop_front();
-            }
-
-            info!("IO is {}", self.io_pending.borrow().len());
-            info!("TASKS is {}", self.tasks.borrow().len());
-            if !self.io_pending.borrow().is_empty() {
-                info!("State is ready, but other tasks may be pending...");
-                self.wait_and_wake().unwrap();
-            } else {
-                info!("Truely ended");
-                break;
+        while !done {
+            info!("POLLING top-level");
+            match future.as_mut().poll(&mut context) {
+                Poll::Pending => {
+                    info!("TOP: State is pending, yeilding to IO-URING");
+                    self.wait_and_wake().unwrap();
+                },
+                Poll::Ready(_item) => {
+                    info!("TOP: State is Ready, returning value");
+                    done = true;
+                    //break item
+                },
             }
         }
 
         info!("End of Top-Level Future");
-        match topt.state.get() {
-            Poll::Ready(r) => r,
-            Poll::Pending => panic!("Task still pending at end!"),
-        }
-    }
-
-    #[tracing::instrument(skip(self, future))]
-    pub(crate) fn submit_task(&self, future: AnyFuture, name: &'static str) -> Rc<Task> {
-        info!("SUBMITTING TO TASKS");
-        let task = Rc::new(Task::new(future, name));
-        self.tasks.borrow_mut().push_back(task.clone());
-        for t in self.tasks.borrow().iter() {
-            info!("    {} -> {:?}", t.name, t.state);
-        }
-        task
     }
 
     #[tracing::instrument(skip(self, future))]
@@ -128,7 +92,6 @@ impl SpawnFree {
         };
         info!("SUBMITTED TO IO-URING");
 
-        //let task = self.submit_task(future, name);
         let task = Rc::new(Task::new(future, name));
 
 
@@ -150,12 +113,10 @@ impl SpawnFree {
 
         if sublen == 0 {
             info!("Nothing on the uring submission queue");
-            //return Ok(())
         } else {
-
+            info!("Submitting {sublen} and waiting");
             let n = uring.submit_and_wait(1)?;
             info!("Submitted {n}");
-
         }
 
         info!("SUB Q is now: {:?}", uring.submission());
