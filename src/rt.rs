@@ -10,11 +10,16 @@ use std::{
     task::{ContextBuilder, LocalWake, LocalWaker, Poll, Waker},
 };
 
+use derivative::Derivative;
 use io_uring::{IoUring, squeue::Entry};
+use tracing::{info, warn};
 
 use crate::errors::Result;
 
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub struct SpawnFree {
+    #[derivative(Debug="ignore")]
     uring: RefCell<IoUring>,
     tasks: RefCell<VecDeque<Rc<Task>>>,
     io_pending: RefCell<HashMap<u64, Rc<Task>>>,
@@ -30,6 +35,7 @@ thread_local! {
 
 impl SpawnFree {
 
+    #[tracing::instrument]
     pub fn new() -> Result<Self> {
 
         Ok(Self {
@@ -41,6 +47,7 @@ impl SpawnFree {
         })
     }
 
+    #[tracing::instrument(skip(self, future))]
     pub fn run_future<F: Future<Output = O> + 'static, O>(&self, future: F) -> () {
         //let mut future = core::pin::pin!(future);
         //let mut future = Box::pin(future);
@@ -50,88 +57,112 @@ impl SpawnFree {
             .local_waker(&waker)
             .build();
 
-        println!("Running Future");
+        info!("Running Future");
         let fut = Box::pin(async move {
-            let ret = future.await;
+            let _ret = future.await;
             let val: Box<dyn Any> = Box::new(12);
             val
         });
-        let topt = self.submit(fut, "top level");
+        let topt = self.submit_task(fut, "top level");
 
         loop {
             let mut task_p = self.tasks.borrow_mut().pop_front();
+
             while let Some(task) = task_p {
                 let name = task.name;
-                println!("POLLING {name}");
+                info!("POLLING {name}");
                 match task.future.borrow_mut().as_mut().poll(&mut context) {
                     Poll::Pending => {
-                        println!("{name}: State is pending, waiting on completion queue");
-                        self.wait_and_wake().unwrap();
+                        info!("{name}: State is pending, pushing back");
+                        self.tasks.borrow_mut().push_back(task.clone());
                     },
-                    Poll::Ready(item) => {
-                        println!("{name}: State is Ready, returning value");
+                    Poll::Ready(_item) => {
+                        info!("{name}: State is Ready, returning value");
                         //break item
                     },
                 }
+                self.wait_and_wake().unwrap();
                 task_p = self.tasks.borrow_mut().pop_front();
             }
-            println!("IO is {}", self.io_pending.borrow().len());
-            println!("TASKS is {}", self.tasks.borrow().len());
+
+            info!("IO is {}", self.io_pending.borrow().len());
+            info!("TASKS is {}", self.tasks.borrow().len());
             if !self.io_pending.borrow().is_empty() {
-                println!("State is ready, but other tasks may be pending...");
+                info!("State is ready, but other tasks may be pending...");
                 self.wait_and_wake().unwrap();
             } else {
-                println!("Truely ended");
+                info!("Truely ended");
                 break;
             }
         }
 
-        println!("End of Top-Level Future");
+        info!("End of Top-Level Future");
         match topt.state.get() {
             Poll::Ready(r) => r,
             Poll::Pending => panic!("Task still pending at end!"),
         }
     }
 
-    pub(crate) fn submit(&self, future: AnyFuture, name: &'static str) -> Rc<Task> {
-        println!("SUBMITTING TO TASKS");
+    #[tracing::instrument(skip(self, future))]
+    pub(crate) fn submit_task(&self, future: AnyFuture, name: &'static str) -> Rc<Task> {
+        info!("SUBMITTING TO TASKS");
         let task = Rc::new(Task::new(future, name));
         self.tasks.borrow_mut().push_back(task.clone());
         for t in self.tasks.borrow().iter() {
-            println!("    {} -> {:?}", t.name, t.state);
+            info!("    {} -> {:?}", t.name, t.state);
         }
         task
     }
 
+    #[tracing::instrument(skip(self, future))]
     pub(crate) fn submit_io(&self, op: Entry, future: AnyFuture, name: &'static str) -> Result<Rc<Task>> {
         let tok = self.next_tok.fetch_add(1, Ordering::SeqCst);
         let op = op.clone()
             .user_data(tok);
 
-        println!("QUEUEING {:?}", op);
+        info!("QUEUEING {:?}", op);
         let mut uring = self.uring.borrow_mut();
         unsafe {
             uring.submission()
                 .push(&op).unwrap()
         };
-        println!("SUBMITTED");
+        info!("SUBMITTED TO IO-URING");
 
-        let task = self.submit(future, name);
+        //let task = self.submit_task(future, name);
+        let task = Rc::new(Task::new(future, name));
+
 
         self.io_pending.borrow_mut().insert(tok, task.clone());
 
         Ok(task)
     }
 
+    #[tracing::instrument(skip(self))]
     fn wait_and_wake(&self) -> Result<()> {
-        println!("Wait & Wake");
+        info!("Wait & Wake");
         let mut uring = self.uring.borrow_mut();
-        let n = uring.submit_and_wait(1)?;
 
-        let completions = uring
-            .completion();
+        let sublen = uring.submission().len();
+        info!("SUB Q LEN = {sublen}");
+        info!("SUB Q: {:?}", uring.submission());
 
-        for entry in completions {
+        info!("COMP Q LEN = {}", uring.completion().len());
+
+        if sublen == 0 {
+            info!("Nothing on the uring submission queue");
+            //return Ok(())
+        } else {
+
+            let n = uring.submit_and_wait(1)?;
+            info!("Submitted {n}");
+
+        }
+
+        info!("SUB Q is now: {:?}", uring.submission());
+        info!("COMP Q len {:?}", uring.completion().len());
+
+        for entry in uring.completion() {
+            info!("GOT COMPLETION {entry:?}");
             let tok = entry.user_data();
             let task = self.io_pending.borrow_mut()
                 .remove(&tok)
@@ -148,14 +179,20 @@ impl SpawnFree {
             let _ = future.as_mut().poll(&mut context);
         }
 
+        info!("DONE WAIT_AND_WAKE");
+
         Ok(())
     }
 }
 
 
+
+#[derive(Derivative)]
+#[derivative(Debug)]
 pub(crate) struct Task {
     pub name: &'static str,
     pub state: Cell<Poll<()>>, // FIXME: Real type?
+    #[derivative(Debug="ignore")]
     pub future: RefCell<AnyFuture>,
 }
 
@@ -169,14 +206,14 @@ impl Task {
     }
 
     pub fn set_ready(&self) {
-        println!("{}: Setting Ready", self.name);
+        info!("{}: Setting Ready", self.name);
         // FIXME: Real data
         self.state.set(Poll::Ready(()));
     }
 }
 
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct IoUringWaker {
 }
 

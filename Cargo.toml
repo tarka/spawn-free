@@ -7,5 +7,8 @@ edition = "2024"
 async-io = "2.6.0"
 
 [dependencies]
+derivative = "2.2.0"
 io-uring = "0.7.11"
+test-log = { version = "0.2.19", default-features = false, features = ["color", "log"] }
 thiserror = "2.0.18"
+tracing = { version = "0.1.44", features = ["async-await", "log-always"] }

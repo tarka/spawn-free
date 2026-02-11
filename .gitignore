@@ -4,3 +4,4 @@
 .envrc
 *~
 /.dir-locals.el
+/out
