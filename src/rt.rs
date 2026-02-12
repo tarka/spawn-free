@@ -29,16 +29,21 @@ pub struct SpawnFree {
 type AnyFuture = Pin<Box<dyn Future<Output = Box<dyn Any>>>>;
 
 thread_local! {
-    pub(crate) static RT:  Rc<SpawnFree> = Rc::new(SpawnFree::new().unwrap());
+    static RT:  Rc<SpawnFree> = Rc::new(SpawnFree::new().unwrap());
 }
 
 impl SpawnFree {
 
     #[tracing::instrument]
     pub fn new() -> Result<Self> {
+        info!("Creating SpawnFree");
+        let uring = IoUring::builder()
+            .setup_sqpoll(1000)
+            .build(16)?;
+        let _n = uring.submit().unwrap();
 
         Ok(Self {
-            uring: RefCell::new(IoUring::new(16)?),
+            uring: RefCell::new(uring),
             io_pending: RefCell::new(HashMap::new()),
             next_tok: AtomicU64::new(1),
             waker: Rc::new(IoUringWaker::new()),
@@ -85,15 +90,14 @@ impl SpawnFree {
             .user_data(tok);
 
         info!("QUEUEING {:?}", op);
-        let mut uring = self.uring.borrow_mut();
+        let uring = self.uring.borrow_mut();
         unsafe {
-            uring.submission()
+            uring.submission_shared()
                 .push(&op).unwrap()
         };
         info!("SUBMITTED TO IO-URING");
 
         let task = Rc::new(Task::new(future, name));
-
 
         self.io_pending.borrow_mut().insert(tok, task.clone());
 
@@ -105,24 +109,22 @@ impl SpawnFree {
         info!("Wait & Wake");
         let mut uring = self.uring.borrow_mut();
 
+        info!("URING ID: {:p}", &uring);
+
         let sublen = uring.submission().len();
         info!("SUB Q LEN = {sublen}");
         info!("SUB Q: {:?}", uring.submission());
 
         info!("COMP Q LEN = {}", uring.completion().len());
 
-        if sublen == 0 {
-            info!("Nothing on the uring submission queue");
-        } else {
-            info!("Submitting {sublen} and waiting");
-            let n = uring.submit_and_wait(1)?;
-            info!("Submitted {n}");
-        }
+        info!("Submitting {sublen} and waiting");
+        let n = uring.submit_and_wait(1)?;
+        info!("Submitted {n}");
 
         info!("SUB Q is now: {:?}", uring.submission());
         info!("COMP Q len {:?}", uring.completion().len());
 
-        for entry in uring.completion() {
+        for entry in unsafe { uring.completion_shared() } {
             info!("GOT COMPLETION {entry:?}");
             let tok = entry.user_data();
             let task = self.io_pending.borrow_mut()
